@@ -18,112 +18,181 @@
 # SPDX-License-Identifier: GPL-3.0+                                     #
 #########################################################################
 
+use utf8;
 use strict;
 use warnings;
 
-my $CURL = 'curl -A "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0"';
-my $curl = $CURL;
+use JSON;
+use LWP::UserAgent;
 
+# autoflush
+$|=1;
+
+# custom HTTP User Agent
+my $userAgent = LWP::UserAgent->new();
+$userAgent->agent("TVthekDL/1.0");
+
+my $quality = "Q8C"; # Q1A low; Q4A average; Q6A high; Q8C very high
+my $mode = "separate"; # whole = whole playlist in one video; separate = separate videos; selected = selected video
+
+# do for all arguments on the command line
 while (my $tvthek = shift)
 {
-    &do($tvthek);
+    &doTVthek($tvthek);
 }
 
 exit 0;
 
-sub do
+sub doTVthek
 {
     my $tvthek = shift;
 
-    $curl = "$CURL -e \"$tvthek\"";
+    # set the HTTP Referrer
+    $userAgent->default_header("Referrer" => $tvthek);
 
-    my $page = &get($tvthek);
+    # get the TVthek page
+    my $response = $userAgent->get($tvthek);
 
-    $page =~ m/&quot;title&quot;:&quot;(.*?)&quot;/ || die "cannot parse title";
-    my $file = "TVthek-DL_" . &escape_title($1) . ".ts";
+    # extract the embedded JSON
+    $response->decoded_content() =~ m/<div class="jsb_ jsb_VideoPlaylist" data-jsb="([^"]+)"/;
+    my $json_string = $1;
+    $json_string =~ s/&quot;/"/g;
+    my $json = decode_json($json_string);
 
+    # process the JSON
+    &doJSON($json);
+}
+
+sub doJSON
+{
+    my $json = shift;
+
+    # overall video title
+    my $title = $json->{playlist}->{title} || die "cannot get title";
+
+    # the video (playlist) may be split into separate jobs (files)
+    my $jobs = [];
+
+    # collect "whole" or "separate" from the playlist
+    foreach my $video (@{$json->{playlist}->{videos}})
+    {
+        foreach my $source (@{$video->{sources}})
+        {
+            if ($source->{quality} eq $quality && $source->{src} =~ m/\/playlist.m3u8$/)
+            {
+                if ($mode eq "whole")
+                {
+                    # implicitly create job 0 and collect all sources
+                    $jobs->[0]->{title} = $title;
+                    push @{$jobs->[0]->{sources}}, $source->{src};
+                }
+                if ($mode eq "separate")
+                {
+                    # create a new job for each video
+                    push @{$jobs}, {};
+                    my $index = substr("00" . scalar(@{$jobs}), -2);
+                    $jobs->[-1]->{title} = "$title - $index $video->{title}";
+                    $jobs->[-1]->{sources}->[0] = $source->{src};
+                }
+            }
+        }
+    }
+
+    # if "separate" but only one video, then use the short title as in "whole"
+    if ($mode eq "separate" && scalar(@{$jobs}) == 1)
+    {
+        $jobs->[0]->{title} = $title;
+    }
+
+    # get "selected" from the selected video
+    if ($mode eq "selected")
+    {
+        my $video = $json->{selected_video};
+        foreach my $source (@{$video->{sources}})
+        {
+            # implicitly create job 0 with one source
+            $jobs->[0]->{title} = $title . " - " . $video->{title};
+            $jobs->[0]->{sources}->[0] = $source->{src};
+        }
+    }
+
+    # execute the jobs
+    foreach my $job (@{$jobs})
+    {
+        &doJob($job);
+    }
+}
+
+sub doJob
+{
+    my $job = shift;
+
+    # file name from job title
+    my $file = "TVthek-DL_-_" . &escape_title($job->{title}) . ".ts";
+    print "FILE: $file\n";
     -f $file && die "download file $file already exists";
 
-    $page =~ m/&quot;src&quot;:&quot;(https:[^:"]*?_Q8C\.mp4)\\\/playlist\.m3u8&quot;/ || die "cannot parse url";
-    my $url = &fix_url($1);
-    $url = &detect_redirect($url);
+    # open the file for writing
+    open FILE, ">$file" || die "cannot open file $file";
 
-    print "$file - $url\n";
+    # download all the sources
+    foreach my $source (@{$job->{sources}})
+    {
+        &doSource($source);
+    }
 
-    my $playlist = &get("$url/playlist.m3u8");
-    print "$playlist";
+    # close the file
+    close FILE || die "cannot close file $file";
+}
+
+sub doSource
+{
+    my $source = shift;
+
+    # get the playlist.m3u8
+    my $response = $userAgent->get($source);
+    my $playlist = $response->decoded_content();
     $playlist =~ m/^chunklist.m3u8$/m || die "invalid playlist; does not contain chunklist";
 
-    my $chunklist = &get("$url/chunklist.m3u8");
-    print "$chunklist";
+    # a redirect happened; get the new base URL
+    my $url = $response->base();
+    $url =~ s/\/[^\/]+$//;
+
+    # get the chunklist.m3u8
+    $response = $userAgent->get("$url/chunklist.m3u8");
+    my $chunklist = $response->decoded_content();
+    $chunklist =~ m/^media_\d+.ts$/m || die "invalid chunklist; does not contain media_*.ts";
+
+    # get the name of the last chunk
+    $chunklist =~ m/.*(media_.*?.ts)/s;
+    my $last = $1;
+    # and download all chunks
     while ($chunklist =~ m/^(media_.*?.ts)$/mg)
     {
-        print "$1\n";
-        &append_chunk_to_file("$url/$1", $file);
+        my $chunk = $1;
+        print "\r$chunk / $last ";
+        $response = $userAgent->get("$url/$chunk");
+        print FILE $response->content();
     }
+    print "\n";
 }
 
 sub escape_title
 {
     my $title = shift;
 
-    $title =~ s/ä/ae/sg;
-    $title =~ s/ö/oe/sg;
-    $title =~ s/ü/ue/sg;
-    $title =~ s/Ä/Ae/sg;
-    $title =~ s/Ö/Oe/sg;
-    $title =~ s/Ü/Ue/sg;
-    $title =~ s/ß/ss/sg;
-    $title =~ s/[^-_a-zA-Z0-9]/_/sg;
-    $title =~ s/__+/_/sg;
-    $title =~ s/_$//sg;
+    $title =~ s/ä/ae/g;
+    $title =~ s/ö/oe/g;
+    $title =~ s/ü/ue/g;
+    $title =~ s/Ä/Ae/g;
+    $title =~ s/Ö/Oe/g;
+    $title =~ s/Ü/Ue/g;
+    $title =~ s/ß/ss/g;
+    $title =~ s/[^-_a-zA-Z0-9]/_/g;
+    $title =~ s/__+/_/g;
+    $title =~ s/_$//;
 
     return $title;
-}
-
-sub fix_url
-{
-    my $url = shift;
-
-    $url =~ s/\\\//\//sg;
-
-    return $url;
-}
-
-sub get
-{
-    my $url = shift;
-
-    open CURL, "$curl \"$url\" 2>/dev/null |";
-    my $page = join '', <CURL>;
-    close CURL;
-
-    return $page;
-}
-
-sub detect_redirect
-{
-    my $url = shift;
-
-    open CURL, "$curl -I \"$url\" 2>/dev/null |";
-    my $headers = join '', <CURL>;
-    close CURL;
-
-    if ($headers =~ m/^Location: (.*)\/playlist\.m3u8\r?\n?$/m)
-    {
-        my $path = $1;
-        $url =~ s/(https:\/\/.+?)\/.*/$1$path/;
-    }
-
-    return $url;
-}
-
-sub append_chunk_to_file
-{
-    my $url = shift;
-    my $file = shift;
-
-    system("$curl \"$url\" >>$file 2>/dev/null") == 0 || die "cannot append";
 }
 
 __END__
