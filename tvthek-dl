@@ -1,0 +1,129 @@
+#!/usr/bin/perl
+#########################################################################
+# Copyright (C) 2019 Claus Schrammel <claus@f05fk.net>                  #
+#                                                                       #
+# This program is free software: you can redistribute it and/or modify  #
+# it under the terms of the GNU General Public License as published by  #
+# the Free Software Foundation, either version 3 of the License, or     #
+# (at your option) any later version.                                   #
+#                                                                       #
+# This program is distributed in the hope that it will be useful,       #
+# but WITHOUT ANY WARRANTY; without even the implied warranty of        #
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the         #
+# GNU General Public License for more details.                          #
+#                                                                       #
+# You should have received a copy of the GNU General Public License     #
+# along with this program.  If not, see <http://www.gnu.org/licenses/>. #
+#                                                                       #
+# SPDX-License-Identifier: GPL-3.0+                                     #
+#########################################################################
+
+use strict;
+use warnings;
+
+my $CURL = 'curl -A "Mozilla/5.0 (X11; Linux x86_64; rv:60.0) Gecko/20100101 Firefox/60.0"';
+my $curl = $CURL;
+
+while (my $tvthek = shift)
+{
+    &do($tvthek);
+}
+
+exit 0;
+
+sub do
+{
+    my $tvthek = shift;
+
+    $curl = "$CURL -e \"$tvthek\"";
+
+    my $page = &get($tvthek);
+
+    $page =~ m/&quot;title&quot;:&quot;(.*?)&quot;/ || die "cannot parse title";
+    my $file = "TVthek-DL_" . &escape_title($1) . ".ts";
+
+    -f $file && die "download file $file already exists";
+
+    $page =~ m/&quot;src&quot;:&quot;(https:[^:"]*?_Q8C\.mp4)\\\/playlist\.m3u8&quot;/ || die "cannot parse url";
+    my $url = &fix_url($1);
+    $url = &detect_redirect($url);
+
+    print "$file - $url\n";
+
+    my $playlist = &get("$url/playlist.m3u8");
+    print "$playlist";
+    $playlist =~ m/^chunklist.m3u8$/m || die "invalid playlist; does not contain chunklist";
+
+    my $chunklist = &get("$url/chunklist.m3u8");
+    print "$chunklist";
+    while ($chunklist =~ m/^(media_.*?.ts)$/mg)
+    {
+        print "$1\n";
+        &append_chunk_to_file("$url/$1", $file);
+    }
+}
+
+sub escape_title
+{
+    my $title = shift;
+
+    $title =~ s/ä/ae/sg;
+    $title =~ s/ö/oe/sg;
+    $title =~ s/ü/ue/sg;
+    $title =~ s/Ä/Ae/sg;
+    $title =~ s/Ö/Oe/sg;
+    $title =~ s/Ü/Ue/sg;
+    $title =~ s/ß/ss/sg;
+    $title =~ s/[^-_a-zA-Z0-9]/_/sg;
+    $title =~ s/__+/_/sg;
+    $title =~ s/_$//sg;
+
+    return $title;
+}
+
+sub fix_url
+{
+    my $url = shift;
+
+    $url =~ s/\\\//\//sg;
+
+    return $url;
+}
+
+sub get
+{
+    my $url = shift;
+
+    open CURL, "$curl \"$url\" 2>/dev/null |";
+    my $page = join '', <CURL>;
+    close CURL;
+
+    return $page;
+}
+
+sub detect_redirect
+{
+    my $url = shift;
+
+    open CURL, "$curl -I \"$url\" 2>/dev/null |";
+    my $headers = join '', <CURL>;
+    close CURL;
+
+    if ($headers =~ m/^Location: (.*)\/playlist\.m3u8\r?\n?$/m)
+    {
+        my $path = $1;
+        $url =~ s/(https:\/\/.+?)\/.*/$1$path/;
+    }
+
+    return $url;
+}
+
+sub append_chunk_to_file
+{
+    my $url = shift;
+    my $file = shift;
+
+    system("$curl \"$url\" >>$file 2>/dev/null") == 0 || die "cannot append";
+}
+
+__END__
