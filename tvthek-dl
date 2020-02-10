@@ -22,6 +22,7 @@ use utf8;
 use strict;
 use warnings;
 
+use Getopt::Long;
 use JSON;
 use LWP::UserAgent;
 
@@ -32,8 +33,16 @@ $|=1;
 my $userAgent = LWP::UserAgent->new();
 $userAgent->agent("TVthekDL/1.0");
 
+# default values
 my $quality = "Q8C"; # Q1A low; Q4A average; Q6A high; Q8C very high
 my $mode = "separate"; # whole = whole playlist in one video; separate = separate videos; selected = selected video
+
+# parse command line options possibly overriding the defaults
+GetOptions(
+    'help' => sub { &usage() },
+    'quality=s' => \$quality,
+    'mode=s' => \$mode,
+) || &usage();
 
 # do for all arguments on the command line
 while (my $tvthek = shift)
@@ -43,6 +52,14 @@ while (my $tvthek = shift)
 
 exit 0;
 
+# print usage and exit
+sub usage
+{
+    print STDERR "usage: $0 [--help] [--quality QUALITY] [--mode MODE] URL [URL ...]\n";
+    exit 1;
+}
+
+# load the video page and extract the JSON
 sub doTVthek
 {
     my $tvthek = shift;
@@ -63,6 +80,7 @@ sub doTVthek
     &doJSON($json);
 }
 
+# extract video information from the JSON
 sub doJSON
 {
     my $json = shift;
@@ -123,6 +141,7 @@ sub doJSON
     }
 }
 
+# create the download file
 sub doJob
 {
     my $job = shift;
@@ -145,6 +164,7 @@ sub doJob
     close FILE || die "cannot close file $file";
 }
 
+# download the source into the file
 sub doSource
 {
     my $source = shift;
@@ -177,6 +197,7 @@ sub doSource
     print "\n";
 }
 
+# substitue/remove special characters from the title/filename
 sub escape_title
 {
     my $title = shift;
